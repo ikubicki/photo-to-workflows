@@ -1,36 +1,34 @@
-import { ChatOpenAI } from '@langchain/openai'
-import { HumanMessage, SystemMessage, type BaseMessage } from '@langchain/core/messages'
-import { type AIMessage } from '@langchain/core/messages'
-import { allTools } from './tools.ts'
+import OpenAI from 'openai'
+import { readFile } from 'fs/promises'
+import { resolve, dirname } from 'path'
+import { fileURLToPath } from 'url'
 import { log, clearLog } from './logger.ts'
+import type { Contact } from '../../fixtures/types.ts'
+
+const __dirname = dirname(fileURLToPath(import.meta.url))
+const CONTACTS_PATH = resolve(__dirname, '../../fixtures/contacts.json')
 
 const LM_STUDIO_BASE_URL = process.env.LM_STUDIO_URL ?? 'http://localhost:1234/v1'
 
-type TokenUsage = { promptTokens: number; completionTokens: number; totalTokens: number }
-
-function addUsage(total: TokenUsage, response: { response_metadata?: Record<string, unknown> }) {
-  const usage = (response.response_metadata?.tokenUsage ?? response.response_metadata?.usage) as Record<string, number> | undefined
-  if (!usage) return
-  total.promptTokens += usage.promptTokens ?? usage.prompt_tokens ?? 0
-  total.completionTokens += usage.completionTokens ?? usage.completion_tokens ?? 0
-  total.totalTokens += usage.totalTokens ?? usage.total_tokens ?? 0
-}
-
-// Vision model for interpreting the workflow diagram image
-const visionModel = new ChatOpenAI({
-  model: 'qwen/qwen3-vl-8b',
-  configuration: { baseURL: LM_STUDIO_BASE_URL, apiKey: 'lm-studio' },
-  temperature: 0.1,
+const client = new OpenAI({
+  baseURL: LM_STUDIO_BASE_URL,
+  apiKey: 'lm-studio',
   maxRetries: 0,
 })
 
-// Main LLM for reasoning and tool use
-const mainModel = new ChatOpenAI({
-  model: 'openai/gpt-oss-20b',
-  configuration: { baseURL: LM_STUDIO_BASE_URL, apiKey: 'lm-studio' },
-  temperature: 0.5,
-  maxRetries: 0,
-}).bindTools(allTools, { tool_choice: 'auto' })
+type TokenUsage = { promptTokens: number; completionTokens: number; totalTokens: number }
+
+function addUsage(total: TokenUsage, usage?: OpenAI.CompletionUsage | null) {
+  if (!usage) return
+  total.promptTokens += usage.prompt_tokens ?? 0
+  total.completionTokens += usage.completion_tokens ?? 0
+  total.totalTokens += usage.total_tokens ?? 0
+}
+
+async function loadContacts(): Promise<Contact[]> {
+  const raw = await readFile(CONTACTS_PATH, 'utf-8')
+  return JSON.parse(raw) as Contact[]
+}
 
 const WORKFLOW_TYPES = `
 export enum Decision {
@@ -96,178 +94,104 @@ Output a structured text description with numbered stages.`
 
   let response
   try {
-    response = await visionModel.invoke([
-      new SystemMessage(systemText),
-      new HumanMessage({
-        content: [
-          {
-            type: 'image_url',
-            image_url: { url: `data:${mimeType};base64,${imageBase64}` },
-          },
-          {
-            type: 'text',
-            text: userText,
-          },
-        ],
-      }),
-    ])
+    response = await client.chat.completions.create({
+      model: 'qwen/qwen3-vl-8b',
+      temperature: 0.1,
+      messages: [
+        { role: 'system', content: systemText },
+        {
+          role: 'user',
+          content: [
+            { type: 'image_url', image_url: { url: `data:${mimeType};base64,${imageBase64}` } },
+            { type: 'text', text: userText },
+          ],
+        },
+      ],
+    })
   } catch (err) {
     log('[VISION] ERROR calling vision model:', (err as Error).message)
     log('[VISION] Stack:', (err as Error).stack)
     throw err
   }
 
-  addUsage(usage, response)
-
-  const result = typeof response.content === 'string'
-    ? response.content
-    : JSON.stringify(response.content)
-
+  addUsage(usage, response.usage)
+  const result = response.choices[0]?.message?.content ?? ''
   log('[VISION] Response:', result)
   return result
 }
 
-async function runAgentLoop(messages: BaseMessage[], usage: TokenUsage): Promise<string> {
-  const toolsByName = Object.fromEntries(allTools.map(t => [t.name, t]))
-  let currentMessages = [...messages]
+async function buildWorkflow(imageDescription: string, contacts: Contact[], usage: TokenUsage): Promise<string> {
+  const contactsJson = JSON.stringify(contacts, null, 2)
 
-  // Agent loop: call model, handle tool calls, repeat until final answer
-  for (let i = 0; i < 50; i++) {
-    log()
-    log('------------------------------')
-    log()
-    log(`\n[AGENT] Iteration ${i + 1} — invoking openai/gpt-oss-20b`)
-    log('[AGENT] Messages sent to model:')
-    for (const msg of currentMessages) {
-      const role = msg.getType()
-      const content = typeof msg.content === 'string' ? msg.content : JSON.stringify(msg.content)
-      if (role === 'ai') {
-        log('AI----', JSON.stringify(msg))
-      }
-      log(`  [${role}] ${content}`)
-    }
-    let response: AIMessage
-    try {
-      response = await mainModel.invoke(currentMessages) as AIMessage
-    } catch (err) {
-      log('[AGENT] ERROR calling reasoning model:', (err as Error).message)
-      log('[AGENT] Stack:', (err as Error).stack)
-      throw err
-    }
-    addUsage(usage, response)
-    currentMessages.push(response)
-    log('----R----', JSON.stringify(response))
-    const responseText = typeof response.content === 'string'
-      ? response.content
-      : JSON.stringify(response.content)
-    log(`[AGENT] Response:`, responseText)
-    log(`[AGENT] Tool calls:`, JSON.stringify(response.tool_calls))
-    log(`[AGENT] Additional kwargs:`, JSON.stringify(response.additional_kwargs))
+  const systemPrompt = `You are an expert workflow architect. Your task is to build a structured Workflow JSON object from a workflow diagram description.
 
-    // Try structured tool_calls first
-    const toolCalls = response.tool_calls ?? []
+Here is the FULL LIST of contacts in the organization:
+${contactsJson}
 
-    if (!toolCalls || toolCalls.length === 0) {
-      // If content is empty or not valid JSON, nudge the model for proper output
-      if (!responseText || responseText === '""' || responseText === '[]' || !looksLikeWorkflowJson(responseText)) {
-        log('[AGENT] No tool calls and response is not valid Workflow JSON — nudging model')
-        currentMessages.push(new HumanMessage(
-          'You did not produce a valid Workflow JSON. Do NOT write tool calls as text. ' +
-          'Output the complete Workflow JSON object now with "name", "stages" (array), and "decision" fields. ' +
-          'Each stage must have "name", "participants" (array), and optionally "dependsOn". ' +
-          'Output ONLY the raw JSON object, nothing else.'
-        ))
-        continue
-      }
-      log('[AGENT] No tool calls — final answer produced')
-      return responseText
-    }
-
-    log(`[AGENT] Tool calls: ${toolCalls.length}`)
-
-    // Execute all tool calls
-    for (const tc of toolCalls) {
-      log(`[TOOL] Calling: ${tc.name}`, JSON.stringify(tc.args))
-      const selectedTool = toolsByName[tc.name]
-      if (!selectedTool) {
-        log(`[TOOL] Not found: ${tc.name}`)
-        currentMessages.push(new HumanMessage(`Tool "${tc.name}" not found.`))
-        continue
-      }
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const toolResult = await (selectedTool as any).invoke(tc.args)
-      const resultStr = typeof toolResult === 'string' ? toolResult : JSON.stringify(toolResult)
-      log(`[TOOL] ${tc.name} result:`, resultStr)
-      const { ToolMessage } = await import('@langchain/core/messages')
-      currentMessages.push(new ToolMessage({
-        tool_call_id: tc.id!,
-        content: resultStr,
-      }))
-    }
-  }
-
-  return 'Agent loop reached maximum iterations without producing a final answer.'
-}
-
-export async function analyzeWorkflow(imageBase64: string, mimeType: string) {
-  clearLog()
-  const usage: TokenUsage = { promptTokens: 0, completionTokens: 0, totalTokens: 0 }
-  log('Step 1: Interpreting workflow diagram image with vision model...')
-  const imageDescription = await interpretImage(imageBase64, mimeType, usage)
-  log('Image interpretation complete.')
-
-  log('\nStep 2: Running agent to build workflow structure...')
-  const systemPrompt = `You are an expert workflow architect. Your task is to build a structured Workflow object from a workflow diagram description.
-
-CRITICAL: You have tools available via the function calling API. You MUST invoke tools using the structured tool_call mechanism — this means generating a proper function call, NOT writing text like "to=functions.find_contact_by_name?..." or "find_contact_by_name({...})". Text-based tool invocations will be IGNORED. Only structured tool_calls will be executed. When you need data, make a real tool call.
-
-You have access to tools to look up contacts in the organization. Follow this OPTIMIZED workflow:
-
-STEP 1 — Get all contacts in one call:
-  Call get_contacts to fetch the full list of contacts with their id, name, email, and position.
-
-STEP 2 — Match ALL diagram participants against the contacts list at once:
-  Compare every person name from the diagram against the returned contacts list. Account for OCR errors — names may be misspelled, truncated, or slightly wrong (e.g. "Ping" instead of "Pino", "Cutlor" instead of "Cutler"). Use fuzzy/partial matching: if a first name or last name partially matches a contact, consider it a match.
-  For each person:
-  - If matched → use the contact's name, id, and role
-  - If NOT matched → use find_contact_by_name with spelling variations to double-check before giving up
-
-STEP 3 — Fill empty stages:
-  For any stage that does NOT have specific people assigned, use find_contact_by_position to suggest 1-2 people. For final/sign-off stages, pick people with the HIGHEST positions in the organization (e.g. CTO, VP, Director).
-
-STEP 4 — Output the Workflow JSON immediately after matching is done. Do NOT make unnecessary extra tool calls.
+Your job:
+1. Compare ALL person names from the diagram against the contacts list above. Account for OCR errors — names may be misspelled, truncated, or slightly wrong (e.g. "Ping" instead of "Pino", "Cutlor" instead of "Cutler", "Karthi" instead of "Karthikeyan"). Use fuzzy/partial matching on first name or last name.
+2. For each matched person, populate "name", "id", and "role" from the contacts list.
+3. If a person from the diagram does NOT match any contact even with fuzzy matching, set ONLY "name" (as written in diagram) and "role". Do NOT populate "id" or invent data.
+4. For stages WITHOUT specific people assigned, suggest 1-2 contacts based on position relevance. For sign-off/final approval stages, pick the HIGHEST-ranking contacts (CTO, VP, Director).
+5. Output a valid JSON object matching the Workflow type.
 
 Use the following TypeScript types to structure your output:
 ${WORKFLOW_TYPES}
 
 IMPORTANT RULES:
-- Do NOT make up data. Only use contacts returned by the tools.
-- For EVERY person name from the diagram, call find_contact_by_name at least once. If no result, try variations (partial name, corrected spelling).
-- If you CANNOT find a matching contact after trying variations, set ONLY "name" (from diagram) and "role" for that participant. Do NOT populate "id" or invent an email.
-- If a contact IS matched, populate "name", "id", and "role" from the contacts list.
-- The "role" should default to "approver" unless the diagram indicates otherwise.
+- Do NOT make up data. Only use contacts from the list above.
+- The "role" should default to "approver" unless the diagram indicates otherwise (e.g. "reviewer", "readonly").
 - All decisions should default to "pending".
 - The workflow decision should be "pending".
-- Stages with no explicit people assigned MUST have at least one suggested participant.
-- For sign-off / final approval stages without people, suggest 1-2 contacts with the highest-ranking positions (CTO, VP, Director, Manager).
 - Parallel stages (no dependency between them) should NOT have dependsOn referencing each other.
-- Output ONLY a valid JSON object matching the Workflow type. No extra text, no markdown fences.`
+- Output ONLY a valid JSON object matching the Workflow type. No extra text, no markdown fences, no explanations.`
 
-  log('[AGENT] System prompt:', systemPrompt)
-  const userMessage = `Here is the description of the approval workflow diagram:\n\n${imageDescription}\n\n` +
-    'Use the available tools to fetch contacts and build the complete Workflow JSON object. ' +
-    'Remember: stages without assigned people need a suggested contact based on position relevance.'
-  log('[AGENT] User message:', userMessage)
+  const userMessage = `Here is the description of the approval workflow diagram:\n\n${imageDescription}\n\nBuild the complete Workflow JSON object. Match all people from the diagram to contacts using fuzzy matching. Stages without assigned people need a suggested contact based on position relevance.`
 
-  const result = await runAgentLoop([
-    new SystemMessage(systemPrompt),
-    new HumanMessage(userMessage),
-  ], usage)
+  log('\n[BUILD] Sending prompt to openai/gpt-oss-20b')
+  log('[BUILD] System prompt:', systemPrompt)
+  log('[BUILD] User message:', userMessage)
+
+  let response
+  try {
+    response = await client.chat.completions.create({
+      model: 'openai/gpt-oss-20b',
+      temperature: 0.5,
+      messages: [
+        { role: 'system', content: systemPrompt },
+        { role: 'user', content: userMessage },
+      ],
+    })
+  } catch (err) {
+    log('[BUILD] ERROR calling reasoning model:', (err as Error).message)
+    log('[BUILD] Stack:', (err as Error).stack)
+    throw err
+  }
+
+  addUsage(usage, response.usage)
+  const result = response.choices[0]?.message?.content ?? ''
+  log('[BUILD] Response:', result)
+  return result
+}
+
+export async function analyzeWorkflow(imageBase64: string, mimeType: string) {
+  clearLog()
+  const usage: TokenUsage = { promptTokens: 0, completionTokens: 0, totalTokens: 0 }
+
+  log('Step 1: Interpreting workflow diagram image with vision model...')
+  const imageDescription = await interpretImage(imageBase64, mimeType, usage)
+  log('Image interpretation complete.')
+
+  log('\nStep 2: Loading contacts...')
+  const contacts = await loadContacts()
+  log(`Loaded ${contacts.length} contacts.`)
+
+  log('\nStep 3: Building workflow structure with reasoning model...')
+  const result = await buildWorkflow(imageDescription, contacts, usage)
 
   log('\nWorkflow analysis complete.')
   log('[RESULT]', result)
 
-  // Strip special tokens and extract JSON
   const cleaned = extractJson(result)
   log('[CLEANED]', cleaned)
   log('[USAGE]', JSON.stringify(usage))
@@ -293,24 +217,11 @@ function isValidWorkflow(obj: unknown): boolean {
   )
 }
 
-function looksLikeWorkflowJson(text: string): boolean {
-  const cleaned = extractJson(text)
-  try {
-    const obj = JSON.parse(cleaned)
-    return isValidWorkflow(obj)
-  } catch {
-    return false
-  }
-}
-
 function extractJson(text: string): string {
-  // Remove common LLM special tokens
   let cleaned = text.replace(/<\|[^>]*\|>/g, '')
-  // Remove markdown code fences
   cleaned = cleaned.replace(/```json\s*/g, '').replace(/```\s*/g, '')
   cleaned = cleaned.trim()
 
-  // Try to extract JSON object from the text
   const start = cleaned.indexOf('{')
   const end = cleaned.lastIndexOf('}')
   if (start !== -1 && end !== -1 && end > start) {
