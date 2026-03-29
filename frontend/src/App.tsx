@@ -5,6 +5,7 @@ function App() {
   const [file, setFile] = useState<File | null>(null)
   const [preview, setPreview] = useState<string | null>(null)
   const [result, setResult] = useState('')
+  const [usage, setUsage] = useState<{ promptTokens: number; completionTokens: number; totalTokens: number } | null>(null)
   const [loading, setLoading] = useState(false)
   const fileRef = useRef<HTMLInputElement>(null)
 
@@ -25,6 +26,7 @@ function App() {
 
     setLoading(true)
     setResult('')
+    setUsage(null)
 
     const formData = new FormData()
     formData.append('image', file)
@@ -42,7 +44,9 @@ function App() {
       }
 
       const data = await res.json()
-      setResult(JSON.stringify(data, null, 2))
+      if (data.usage) setUsage(data.usage)
+      const display = data.workflow ?? data.raw ?? data
+      setResult(JSON.stringify(display, null, 2))
     } catch (err) {
       setResult(`Error: ${err instanceof Error ? err.message : String(err)}`)
     } finally {
@@ -87,6 +91,11 @@ function App() {
           rows={20}
           placeholder="Analysis result will appear here..."
         />
+        {usage && (
+          <p className="usage">
+            Tokens — prompt: {usage.promptTokens}, completion: {usage.completionTokens}, total: {usage.totalTokens}
+          </p>
+        )}
       </div>
     </div>
   )

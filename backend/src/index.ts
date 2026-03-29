@@ -1,6 +1,7 @@
 import Fastify from 'fastify'
 import multipart from '@fastify/multipart'
-import { analyzeWorkflow } from './workflow.js'
+import { analyzeWorkflow } from './workflow.ts'
+import { log } from './logger.ts'
 
 const app = Fastify({ logger: true })
 
@@ -20,8 +21,14 @@ app.post('/api/analyze', async (request, reply) => {
 
   const buffer = await file.toBuffer()
   const imageBase64 = buffer.toString('base64')
-  const result = await analyzeWorkflow(imageBase64, mimeType)
-  return result
+  try {
+    const result = await analyzeWorkflow(imageBase64, mimeType)
+    return result
+  } catch (err) {
+    log('[ERROR] Request failed:', (err as Error).message)
+    log('[ERROR] Stack:', (err as Error).stack)
+    return reply.status(500).send({ error: (err as Error).message })
+  }
 })
 
 const PORT = Number(process.env.PORT ?? 4000)

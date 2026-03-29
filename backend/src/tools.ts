@@ -3,7 +3,7 @@ import { resolve, dirname } from 'path'
 import { fileURLToPath } from 'url'
 import { tool } from '@langchain/core/tools'
 import { z } from 'zod'
-import type { Contact } from '../../fixtures/types.js'
+import type { Contact } from '../../fixtures/types.ts'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
 const CONTACTS_PATH = resolve(__dirname, '../../fixtures/contacts.json')

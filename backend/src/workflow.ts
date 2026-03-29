@@ -1,23 +1,36 @@
 import { ChatOpenAI } from '@langchain/openai'
 import { HumanMessage, SystemMessage, type BaseMessage } from '@langchain/core/messages'
 import { type AIMessage } from '@langchain/core/messages'
-import { allTools } from './tools.js'
+import { allTools } from './tools.ts'
+import { log, clearLog } from './logger.ts'
 
 const LM_STUDIO_BASE_URL = process.env.LM_STUDIO_URL ?? 'http://localhost:1234/v1'
+
+type TokenUsage = { promptTokens: number; completionTokens: number; totalTokens: number }
+
+function addUsage(total: TokenUsage, response: { response_metadata?: Record<string, unknown> }) {
+  const usage = (response.response_metadata?.tokenUsage ?? response.response_metadata?.usage) as Record<string, number> | undefined
+  if (!usage) return
+  total.promptTokens += usage.promptTokens ?? usage.prompt_tokens ?? 0
+  total.completionTokens += usage.completionTokens ?? usage.completion_tokens ?? 0
+  total.totalTokens += usage.totalTokens ?? usage.total_tokens ?? 0
+}
 
 // Vision model for interpreting the workflow diagram image
 const visionModel = new ChatOpenAI({
   model: 'qwen/qwen3-vl-8b',
   configuration: { baseURL: LM_STUDIO_BASE_URL, apiKey: 'lm-studio' },
   temperature: 0.1,
+  maxRetries: 0,
 })
 
 // Main LLM for reasoning and tool use
 const mainModel = new ChatOpenAI({
   model: 'openai/gpt-oss-20b',
   configuration: { baseURL: LM_STUDIO_BASE_URL, apiKey: 'lm-studio' },
-  temperature: 0.1,
-}).bindTools(allTools)
+  temperature: 0.5,
+  maxRetries: 0,
+}).bindTools(allTools, { tool_choice: 'auto' })
 
 const WORKFLOW_TYPES = `
 export enum Decision {
@@ -59,7 +72,7 @@ export type Workflow = {
 }
 `
 
-async function interpretImage(imageBase64: string, mimeType: string): Promise<string> {
+async function interpretImage(imageBase64: string, mimeType: string, usage: TokenUsage): Promise<string> {
   const systemText = `You are an expert at reading approval workflow diagrams. Your job is to extract ALL information accurately.
 
 RULES:
@@ -76,77 +89,115 @@ RULES:
 Output a structured text description with numbered stages.`
   const userText = 'Analyze this approval workflow diagram. Count ALL rectangles/boxes — each one is a stage. List every stage with its participants, roles, and the dependency/condition arrows between stages. Pay special attention to parallel vs sequential stages and read all names very carefully character by character.'
 
-  console.log('\n[VISION] Sending prompt to qwen/qwen3-vl-8b')
-  console.log('[VISION] System:', systemText)
-  console.log('[VISION] User:', userText)
-  console.log(`[VISION] Image: ${mimeType}, ${Math.round(imageBase64.length * 0.75 / 1024)}KB`)
+  log('\n[VISION] Sending prompt to qwen/qwen3-vl-8b')
+  log('[VISION] System:', systemText)
+  log('[VISION] User:', userText)
+  log(`[VISION] Image: ${mimeType}, ${Math.round(imageBase64.length * 0.75 / 1024)}KB`)
 
-  const response = await visionModel.invoke([
-    new SystemMessage(systemText),
-    new HumanMessage({
-      content: [
-        {
-          type: 'image_url',
-          image_url: { url: `data:${mimeType};base64,${imageBase64}` },
-        },
-        {
-          type: 'text',
-          text: userText,
-        },
-      ],
-    }),
-  ])
+  let response
+  try {
+    response = await visionModel.invoke([
+      new SystemMessage(systemText),
+      new HumanMessage({
+        content: [
+          {
+            type: 'image_url',
+            image_url: { url: `data:${mimeType};base64,${imageBase64}` },
+          },
+          {
+            type: 'text',
+            text: userText,
+          },
+        ],
+      }),
+    ])
+  } catch (err) {
+    log('[VISION] ERROR calling vision model:', (err as Error).message)
+    log('[VISION] Stack:', (err as Error).stack)
+    throw err
+  }
+
+  addUsage(usage, response)
 
   const result = typeof response.content === 'string'
     ? response.content
     : JSON.stringify(response.content)
 
-  console.log('[VISION] Response:', result)
+  log('[VISION] Response:', result)
   return result
 }
 
-async function runAgentLoop(messages: BaseMessage[]): Promise<string> {
+async function runAgentLoop(messages: BaseMessage[], usage: TokenUsage): Promise<string> {
   const toolsByName = Object.fromEntries(allTools.map(t => [t.name, t]))
   let currentMessages = [...messages]
 
   // Agent loop: call model, handle tool calls, repeat until final answer
-  for (let i = 0; i < 10; i++) {
-    console.log(`\n[AGENT] Iteration ${i + 1} — invoking openai/gpt-oss-20b`)
-    console.log('[AGENT] Messages sent to model:')
+  for (let i = 0; i < 50; i++) {
+    log()
+    log('------------------------------')
+    log()
+    log(`\n[AGENT] Iteration ${i + 1} — invoking openai/gpt-oss-20b`)
+    log('[AGENT] Messages sent to model:')
     for (const msg of currentMessages) {
-      const role = msg._getType()
+      const role = msg.getType()
       const content = typeof msg.content === 'string' ? msg.content : JSON.stringify(msg.content)
-      console.log(`  [${role}] ${content}`)
+      if (role === 'ai') {
+        log('AI----', JSON.stringify(msg))
+      }
+      log(`  [${role}] ${content}`)
     }
-    const response = await mainModel.invoke(currentMessages) as AIMessage
+    let response: AIMessage
+    try {
+      response = await mainModel.invoke(currentMessages) as AIMessage
+    } catch (err) {
+      log('[AGENT] ERROR calling reasoning model:', (err as Error).message)
+      log('[AGENT] Stack:', (err as Error).stack)
+      throw err
+    }
+    addUsage(usage, response)
     currentMessages.push(response)
-
+    log('----R----', JSON.stringify(response))
     const responseText = typeof response.content === 'string'
       ? response.content
       : JSON.stringify(response.content)
-    console.log(`[AGENT] Response:`, responseText)
+    log(`[AGENT] Response:`, responseText)
+    log(`[AGENT] Tool calls:`, JSON.stringify(response.tool_calls))
+    log(`[AGENT] Additional kwargs:`, JSON.stringify(response.additional_kwargs))
 
-    const toolCalls = response.tool_calls
+    // Try structured tool_calls first
+    const toolCalls = response.tool_calls ?? []
+
     if (!toolCalls || toolCalls.length === 0) {
-      console.log('[AGENT] No tool calls — final answer produced')
+      // If content is empty or not valid JSON, nudge the model for proper output
+      if (!responseText || responseText === '""' || responseText === '[]' || !looksLikeWorkflowJson(responseText)) {
+        log('[AGENT] No tool calls and response is not valid Workflow JSON — nudging model')
+        currentMessages.push(new HumanMessage(
+          'You did not produce a valid Workflow JSON. Do NOT write tool calls as text. ' +
+          'Output the complete Workflow JSON object now with "name", "stages" (array), and "decision" fields. ' +
+          'Each stage must have "name", "participants" (array), and optionally "dependsOn". ' +
+          'Output ONLY the raw JSON object, nothing else.'
+        ))
+        continue
+      }
+      log('[AGENT] No tool calls — final answer produced')
       return responseText
     }
 
-    console.log(`[AGENT] Tool calls: ${toolCalls.length}`)
+    log(`[AGENT] Tool calls: ${toolCalls.length}`)
 
     // Execute all tool calls
     for (const tc of toolCalls) {
-      console.log(`[TOOL] Calling: ${tc.name}`, JSON.stringify(tc.args))
+      log(`[TOOL] Calling: ${tc.name}`, JSON.stringify(tc.args))
       const selectedTool = toolsByName[tc.name]
       if (!selectedTool) {
-        console.log(`[TOOL] Not found: ${tc.name}`)
+        log(`[TOOL] Not found: ${tc.name}`)
         currentMessages.push(new HumanMessage(`Tool "${tc.name}" not found.`))
         continue
       }
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const toolResult = await (selectedTool as any).invoke(tc.args)
       const resultStr = typeof toolResult === 'string' ? toolResult : JSON.stringify(toolResult)
-      console.log(`[TOOL] ${tc.name} result:`, resultStr)
+      log(`[TOOL] ${tc.name} result:`, resultStr)
       const { ToolMessage } = await import('@langchain/core/messages')
       currentMessages.push(new ToolMessage({
         tool_call_id: tc.id!,
@@ -159,22 +210,32 @@ async function runAgentLoop(messages: BaseMessage[]): Promise<string> {
 }
 
 export async function analyzeWorkflow(imageBase64: string, mimeType: string) {
-  console.log('Step 1: Interpreting workflow diagram image with vision model...')
-  const imageDescription = await interpretImage(imageBase64, mimeType)
-  console.log('Image interpretation complete.')
+  clearLog()
+  const usage: TokenUsage = { promptTokens: 0, completionTokens: 0, totalTokens: 0 }
+  log('Step 1: Interpreting workflow diagram image with vision model...')
+  const imageDescription = await interpretImage(imageBase64, mimeType, usage)
+  log('Image interpretation complete.')
 
-  console.log('\nStep 2: Running agent to build workflow structure...')
+  log('\nStep 2: Running agent to build workflow structure...')
   const systemPrompt = `You are an expert workflow architect. Your task is to build a structured Workflow object from a workflow diagram description.
 
-You have access to tools to look up contacts in the organization. You MUST use these tools to:
-1. First, get the count of available contacts using get_contacts_count.
-2. Then, get the full list of contacts using get_contacts.
-3. For EACH person mentioned in the diagram, use find_contact_by_name to search. The vision model may have made OCR errors — names can be misspelled, truncated, or slightly wrong. Try multiple search strategies:
-   - Search by first name (e.g. "Dave", "Brian", "Karthik")
-   - Search by last name (e.g. "Cutler", "Pino", "Ravinthar")
-   - If a name looks wrong (e.g. "Ping" instead of "Pino"), try similar-sounding variations
-   - Search partial strings (3+ characters) to catch OCR errors
-4. For any stage that does NOT have specific people assigned, use find_contact_by_position to suggest 1-2 people. For final/sign-off stages, pick people with the HIGHEST positions in the organization (e.g. CTO, VP, Director).
+CRITICAL: You have tools available via the function calling API. You MUST invoke tools using the structured tool_call mechanism — this means generating a proper function call, NOT writing text like "to=functions.find_contact_by_name?..." or "find_contact_by_name({...})". Text-based tool invocations will be IGNORED. Only structured tool_calls will be executed. When you need data, make a real tool call.
+
+You have access to tools to look up contacts in the organization. Follow this OPTIMIZED workflow:
+
+STEP 1 — Get all contacts in one call:
+  Call get_contacts to fetch the full list of contacts with their id, name, email, and position.
+
+STEP 2 — Match ALL diagram participants against the contacts list at once:
+  Compare every person name from the diagram against the returned contacts list. Account for OCR errors — names may be misspelled, truncated, or slightly wrong (e.g. "Ping" instead of "Pino", "Cutlor" instead of "Cutler"). Use fuzzy/partial matching: if a first name or last name partially matches a contact, consider it a match.
+  For each person:
+  - If matched → use the contact's name, id, and role
+  - If NOT matched → use find_contact_by_name with spelling variations to double-check before giving up
+
+STEP 3 — Fill empty stages:
+  For any stage that does NOT have specific people assigned, use find_contact_by_position to suggest 1-2 people. For final/sign-off stages, pick people with the HIGHEST positions in the organization (e.g. CTO, VP, Director).
+
+STEP 4 — Output the Workflow JSON immediately after matching is done. Do NOT make unnecessary extra tool calls.
 
 Use the following TypeScript types to structure your output:
 ${WORKFLOW_TYPES}
@@ -192,28 +253,53 @@ IMPORTANT RULES:
 - Parallel stages (no dependency between them) should NOT have dependsOn referencing each other.
 - Output ONLY a valid JSON object matching the Workflow type. No extra text, no markdown fences.`
 
-  console.log('[AGENT] System prompt:', systemPrompt)
+  log('[AGENT] System prompt:', systemPrompt)
   const userMessage = `Here is the description of the approval workflow diagram:\n\n${imageDescription}\n\n` +
     'Use the available tools to fetch contacts and build the complete Workflow JSON object. ' +
     'Remember: stages without assigned people need a suggested contact based on position relevance.'
-  console.log('[AGENT] User message:', userMessage)
+  log('[AGENT] User message:', userMessage)
 
   const result = await runAgentLoop([
     new SystemMessage(systemPrompt),
     new HumanMessage(userMessage),
-  ])
+  ], usage)
 
-  console.log('\nWorkflow analysis complete.')
-  console.log('[RESULT]', result)
+  log('\nWorkflow analysis complete.')
+  log('[RESULT]', result)
 
   // Strip special tokens and extract JSON
   const cleaned = extractJson(result)
-  console.log('[CLEANED]', cleaned)
+  log('[CLEANED]', cleaned)
+  log('[USAGE]', JSON.stringify(usage))
 
   try {
-    return JSON.parse(cleaned)
+    const parsed = JSON.parse(cleaned)
+    if (isValidWorkflow(parsed)) {
+      return { workflow: parsed, usage }
+    }
+    log('[WARN] Parsed JSON is not a valid Workflow (missing stages). Raw:', cleaned)
+    return { raw: result, usage }
   } catch {
-    return { raw: result }
+    return { raw: result, usage }
+  }
+}
+
+function isValidWorkflow(obj: unknown): boolean {
+  return (
+    typeof obj === 'object' &&
+    obj !== null &&
+    'stages' in obj &&
+    Array.isArray((obj as Record<string, unknown>).stages)
+  )
+}
+
+function looksLikeWorkflowJson(text: string): boolean {
+  const cleaned = extractJson(text)
+  try {
+    const obj = JSON.parse(cleaned)
+    return isValidWorkflow(obj)
+  } catch {
+    return false
   }
 }
 

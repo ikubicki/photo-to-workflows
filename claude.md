@@ -23,6 +23,7 @@ Both models are served locally via **LM Studio** (OpenAI-compatible API at `http
   1. User uploads an image of an approval workflow diagram
   2. Image is sent as `multipart/form-data` to `POST /api/analyze`
   3. Backend response (JSON) is displayed in a readonly `<textarea>`
+  4. Total token usage (prompt, completion, total) displayed below the textarea
 
 ### Run
 
@@ -40,36 +41,42 @@ cd frontend && npm run dev
 #### `POST /api/analyze`
 
 - **Body**: `multipart/form-data` with field `image` (image file, max 10MB)
-- **Response**: JSON `Workflow` object
+- **Response**: JSON object with `workflow` (Workflow object), `usage` (token counts), or `raw` + `usage` on parse failure
 
-### Processing Pipeline
+### Processing Pipeline (`src/workflow.ts`)
 
-1. **Image interpretation** – The uploaded image is sent to `qwen/qwen3-vl-8b` (vision model) with detailed instructions:
+1. **Image interpretation** (`interpretImage()`) – The uploaded image is sent to `qwen/qwen3-vl-8b` (vision model, temp 0.1) with detailed instructions:
    - Each rectangle/box = separate stage (never merge or skip)
    - Side-by-side stages = parallel (no dependency), sequential = vertical/connected
    - Read names character by character (OCR error awareness: 'ng'→'no', 'rn'→'m')
+   - Pay attention to arrows/connectors for dependencies and conditions
    - Output numbered stages with full dependency graph
 
-2. **Agent loop** – The description is passed to `openai/gpt-oss-20b` (reasoning model) bound with LangChain tools. The agent:
-   - Fetches the contacts count (`get_contacts_count`)
-   - Fetches the full contacts list (`get_contacts`)
-   - For each person in the diagram, searches by first name, last name, and spelling variations (`find_contact_by_name`)
+2. **Agent loop** (`runAgentLoop()`) – The description is passed to `openai/gpt-oss-20b` (reasoning model, temp 0.5) bound with LangChain tools via `.bindTools(allTools, { tool_choice: 'auto' })`. Max 50 iterations. Both models use `maxRetries: 0` so connection errors surface immediately. The agent follows an optimized 4-step workflow:
+   - **Step 1**: Fetches the full contacts list in one call (`get_contacts`)
+   - **Step 2**: Compares ALL diagram participants against the contacts list at once using fuzzy/partial matching (accounting for OCR errors). Only falls back to `find_contact_by_name` with spelling variations for unmatched names
+   - **Step 3**: For stages without assigned people, uses `find_contact_by_position` to suggest 1–2 contacts; for sign-off/final stages picks highest-ranking (CTO, VP)
+   - **Step 4**: Outputs the Workflow JSON immediately — no unnecessary extra tool calls
    - If no contact matched: sets only `name` + `role` (no `id`)
-   - For stages without assigned people, suggests 1–2 contacts based on position relevance (`find_contact_by_position`); for sign-off/final stages picks highest-ranking (CTO, VP)
-   - Builds a `Workflow` JSON object using the types from `fixtures/types.ts`
+   - System prompt includes the full `Workflow` TypeScript types inline for reference
+   - System prompt explicitly forbids text-based tool invocations (e.g. `to=functions.find_contact_by_name?...`)
 
-3. **Response cleanup** – Strips LLM special tokens (`<|...|>`), markdown fences, and extracts JSON object before returning.
+3. **Response validation** – When no tool calls are present, the agent checks if the response is valid Workflow JSON using `looksLikeWorkflowJson()` (parses and verifies `stages` array exists). If not valid, it nudges the model with a human message requesting proper JSON output and continues the loop.
 
-4. **Logging** – Full logging of all prompts, messages, tool calls, tool results, and final output (prefixed `[VISION]`, `[AGENT]`, `[TOOL]`, `[RESULT]`).
+4. **Response cleanup** (`extractJson()`) – Strips LLM special tokens (`<|...|>`), markdown fences, and extracts JSON object (first `{` to last `}`) before returning. Final validation with `isValidWorkflow()` checks the parsed JSON has a `stages` array.
 
-### LangChain Tools
+5. **Logging** (`src/logger.ts`) – File-based logging to `logs/agent.log` with timestamps + stdout. `clearLog()` resets the log file on each new upload. Prefixed sections: `[VISION]`, `[AGENT]`, `[TOOL]`, `[RESULT]`, `[CLEANED]`.
+
+### LangChain Tools (`src/tools.ts`)
 
 | Tool | Description |
 |---|---|
 | `get_contacts` | Returns full contacts list (from `fixtures/contacts.json`) |
 | `get_contacts_count` | Returns the total number of contacts |
-| `find_contact_by_name` | Searches contacts by name (partial match) |
-| `find_contact_by_position` | Searches contacts by position/role (partial match) |
+| `find_contact_by_name` | Searches contacts by name (partial, case-insensitive match) |
+| `find_contact_by_position` | Searches contacts by position/role (partial, case-insensitive match) |
+
+All tools load contacts from `fixtures/contacts.json` via `loadContacts()`. Schemas defined with `zod`.
 
 ### Run
 
@@ -91,6 +98,7 @@ cd backend && npm run dev
 - `Participant` → `name`, `id?` (optional, only if matched), `role` (approver/reviewer/readonly), `decision`
 - `StageDependency` → `parentStageId`, `condition` (decision/deadline/completion)
 - `Decision` → enum: approved, rejected, change_requested, pending, completed
+- `Contact` → `id`, `name`, `email`, `position`
 
 ## Contacts (`fixtures/contacts.json`)
 
