@@ -80,6 +80,7 @@ RULES:
 - Pay very close attention to arrows and connectors: they show dependencies and conditions between stages.
 - Read ALL text inside and near each box carefully: stage names, people names, roles, conditions.
 - OCR can be tricky — read names character by character. Common OCR errors: 'ng' misread as 'no', 'rn' misread as 'm', letters confused. Double-check every person's name.
+- A participant name might be very short — even a single character (e.g. "H"). If two names appear on separate lines inside a box, they are SEPARATE participants. Do NOT merge them into one name.
 - For each stage, list: stage name, all participants (names exactly as written), their roles, and any conditions/decisions on connecting arrows.
 - Describe the FULL dependency graph: which stages depend on which, and what condition triggers the next stage (e.g. "approved", "approved or approved with changes", "completed").
 - If a stage has no participants listed, explicitly note that.
