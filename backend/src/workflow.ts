@@ -7,6 +7,7 @@ import type { Contact } from '../../fixtures/types.ts'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
 const CONTACTS_PATH = resolve(__dirname, '../../fixtures/contacts.json')
+const TYPES_PATH = resolve(__dirname, '../../fixtures/types.ts')
 
 const LM_STUDIO_BASE_URL = process.env.LM_STUDIO_URL ?? 'http://localhost:1234/v1'
 
@@ -30,45 +31,9 @@ async function loadContacts(): Promise<Contact[]> {
   return JSON.parse(raw) as Contact[]
 }
 
-const WORKFLOW_TYPES = `
-export enum Decision {
-    APPROVED = 'approved',
-    REJECTED = 'rejected',
-    CHANGE_REQUESTED = 'change_requested',
-    PENDING = 'pending',
-    COMPLETED = 'completed',
+async function loadWorkflowTypes(): Promise<string> {
+  return await readFile(TYPES_PATH, 'utf-8')
 }
-
-export type Participant = {
-    name: string,
-    id?: string,
-    role: 'approver' | 'reviewer' | 'readonly',
-    decision?: Decision,
-}
-
-export type StageDependency = {
-    parentStageId: string,
-    condition: 'decision' | 'deadline' | 'completion',
-    decision?: Decision,
-    deadline?: Date,
-}
-
-export type Stage = {
-    name: string,
-    participants: Participant[],
-    dependsOn?: StageDependency[],
-    deadline?: Date,
-    decision?: Decision,
-    metadata?: Record<string, any>,
-}
-
-export type Workflow = {
-    name: string,
-    stages: Stage[],
-    metadata?: Record<string, any>,
-    decision?: Decision,
-}
-`
 
 async function interpretImage(imageBase64: string, mimeType: string, usage: TokenUsage): Promise<string> {
   const systemText = `You are an expert at reading approval workflow diagrams. Your job is to extract ALL information accurately.
@@ -83,6 +48,7 @@ RULES:
 - A participant name might be very short — even a single character (e.g. "H"). If two names appear on separate lines inside a box, they are SEPARATE participants. Do NOT merge them into one name.
 - For each stage, list: stage name, all participants (names exactly as written), their roles, and any conditions/decisions on connecting arrows.
 - Describe the FULL dependency graph: which stages depend on which, and what condition triggers the next stage (e.g. "approved", "approved or approved with changes", "completed").
+- If an arrow/condition says "approved/with changes", interpret it as TWO conditions: "approved" AND "approved with changes". Both outcomes lead to the next stage.
 - If a stage has no participants listed, explicitly note that.
 
 Output a structured text description with numbered stages.`
@@ -121,7 +87,7 @@ Output a structured text description with numbered stages.`
   return result
 }
 
-async function buildWorkflow(imageDescription: string, contacts: Contact[], usage: TokenUsage): Promise<string> {
+async function buildWorkflow(imageDescription: string, contacts: Contact[], workflowTypes: string, usage: TokenUsage): Promise<string> {
   const contactsJson = JSON.stringify(contacts, null, 2)
 
   const systemPrompt = `You are an expert workflow architect. Your task is to build a structured Workflow JSON object from a workflow diagram description.
@@ -131,13 +97,13 @@ ${contactsJson}
 
 Your job:
 1. Compare ALL person names from the diagram against the contacts list above. Account for OCR errors — names may be misspelled, truncated, or slightly wrong (e.g. "Ping" instead of "Pino", "Cutlor" instead of "Cutler", "Karthi" instead of "Karthikeyan"). Use fuzzy/partial matching on first name or last name.
-2. For each matched person, populate "name", "id", and "role" from the contacts list.
+2. For each matched person, populate "name" (use the contact's name, NOT the OCR'd name from the diagram), "id", and "role" from the contacts list.
 3. If a person from the diagram does NOT match any contact even with fuzzy matching, set ONLY "name" (as written in diagram) and "role". Do NOT populate "id" or invent data.
 4. For stages WITHOUT specific people assigned, suggest 1-2 contacts based on position relevance. For sign-off/final approval stages, pick the HIGHEST-ranking contacts (CTO, VP, Director).
 5. Output a valid JSON object matching the Workflow type.
 
 Use the following TypeScript types to structure your output:
-${WORKFLOW_TYPES}
+${workflowTypes}
 
 IMPORTANT RULES:
 - Do NOT make up data. Only use contacts from the list above.
@@ -183,12 +149,12 @@ export async function analyzeWorkflow(imageBase64: string, mimeType: string) {
   const imageDescription = await interpretImage(imageBase64, mimeType, usage)
   log('Image interpretation complete.')
 
-  log('\nStep 2: Loading contacts...')
-  const contacts = await loadContacts()
+  log('\nStep 2: Loading contacts and types...')
+  const [contacts, workflowTypes] = await Promise.all([loadContacts(), loadWorkflowTypes()])
   log(`Loaded ${contacts.length} contacts.`)
 
   log('\nStep 3: Building workflow structure with reasoning model...')
-  const result = await buildWorkflow(imageDescription, contacts, usage)
+  const result = await buildWorkflow(imageDescription, contacts, workflowTypes, usage)
 
   log('\nWorkflow analysis complete.')
   log('[RESULT]', result)
