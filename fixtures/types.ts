@@ -55,7 +55,7 @@ export type Workflow = {
     // optional metadata for the workflow
     metadata?: Record<string, any>,
     // workflow decision, defaults to 'pending'
-    decision?: Decision,
+    decision?: Decision | Decision[],
 }
 
 export type Contact = {
