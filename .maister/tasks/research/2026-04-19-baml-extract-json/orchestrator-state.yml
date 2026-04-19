@@ -1,0 +1,51 @@
+orchestrator:
+  started_phase: phase-1
+  completed_phases: []
+  failed_phases: []
+  auto_fix_attempts: {}
+  options:
+    brainstorming_enabled: null
+    design_enabled: null
+  created: "2026-04-19T00:00:00Z"
+  updated: "2026-04-19T00:00:00Z"
+  task_path: .maister/tasks/research/2026-04-19-baml-extract-json
+  task_ids: {}
+
+task:
+  title: "Replace extractJson with BAML"
+  description: "Research how to use BAML to replace the extractJson function for structured LLM output parsing in the workflow visual analyzer"
+  status: in_progress
+  tags: [baml, llm-output, structured-data]
+  priority: medium
+
+research_context:
+  research_type: "technical"
+  research_question: "How to replace extractJson with BAML for structured LLM output handling in the workflow visual analyzer?"
+  scope:
+    included:
+      - BAML library capabilities and API
+      - Current extractJson implementation
+      - OpenAI SDK integration with BAML
+      - TypeScript/Node.js BAML support
+    excluded:
+      - Other structured output libraries (Instructor, Outlines, etc.)
+      - Python BAML usage
+    constraints:
+      - Must work with LM Studio (OpenAI-compatible API)
+      - Must work with TypeScript/ESM
+      - Must produce Workflow type output
+  methodology: []
+  sources: []
+  confidence_level: "high"
+  gathering_strategy:
+    categories: [baml-docs, baml-typescript, codebase-current, baml-compatibility]
+    count: 4
+    source: "planner"
+  phase_summaries:
+    phase-1:
+      summary: "BAML can replace extractJson with type-safe structured output parsing. SAP parser handles more edge cases than current approach. All TypeScript types map to BAML. LM Studio officially supported. Main risk: token usage tracking via Collector API."
+      steps_completed: [init, plan, gather, synthesize]
+
+options:
+  brainstorming_enabled: false
+  design_enabled: false

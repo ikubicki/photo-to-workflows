@@ -5,9 +5,11 @@
   "type": "module",
   "scripts": {
     "dev": "tsx watch src/index.ts",
-    "start": "tsx src/index.ts"
+    "start": "tsx src/index.ts",
+    "baml:generate": "npx baml-cli generate"
   },
   "dependencies": {
+    "@boundaryml/baml": "^0.221.0",
     "@fastify/multipart": "^9.0.0",
     "fastify": "^5.2.0",
     "openai": "^6.33.0"

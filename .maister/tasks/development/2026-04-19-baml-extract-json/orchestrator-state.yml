@@ -1,0 +1,70 @@
+orchestrator:
+  started_phase: phase-14
+  completed_phases: [phase-1, phase-2, phase-5, phase-6, phase-7, phase-8, phase-10, phase-11]
+  failed_phases: []
+  auto_fix_attempts: {}
+  options:
+    spec_audit_enabled: true
+    skip_test_suite: true
+    e2e_enabled: false
+    user_docs_enabled: false
+    code_review_enabled: true
+    pragmatic_review_enabled: true
+    reality_check_enabled: true
+    production_check_enabled: true
+  created: "2026-04-19T00:00:00Z"
+  updated: "2026-04-19T00:00:00Z"
+  task_path: .maister/tasks/development/2026-04-19-baml-extract-json
+  task_ids: {}
+
+task:
+  title: "Replace extractJson with BAML"
+  description: "Replace extractJson() and isValidWorkflow() in backend/src/workflow.ts with BAML structured output parsing. Install BAML, create .baml schema files mapping current Workflow types, configure LM Studio via openai-generic provider, and replace buildWorkflow() output handling with typed BAML function call."
+  status: in_progress
+  tags: [baml, llm-output, structured-data, backend]
+  priority: medium
+
+task_context:
+  risk_level: low
+  clarifications_resolved: true
+  scope_expanded: null
+  architecture_decision: null
+  task_characteristics:
+    has_reproducible_defect: false
+    modifies_existing_code: true
+    creates_new_entities: true
+    involves_data_operations: false
+    ui_heavy: false
+  research_reference:
+    path: .maister/tasks/research/2026-04-19-baml-extract-json
+    research_question: "How to replace extractJson with BAML for structured LLM output handling in the workflow visual analyzer?"
+    research_type: "technical"
+    confidence_level: "high"
+  phase_summaries:
+    research:
+      summary: "BAML can replace extractJson with type-safe structured output parsing. SAP parser handles more edge cases than current approach. All TypeScript types map to BAML. LM Studio officially supported via openai-generic provider. Main risk: token usage tracking via Collector API."
+      key_findings:
+        - "SAP parser is superset of extractJson — handles malformed JSON, type coercion, fuzzy keys"
+        - "All TypeScript types map to BAML with minor adjustments (Date→string, any→string)"
+        - "LM Studio has dedicated BAML docs page, openai-generic provider"
+        - "Integration scope: ~3 files changed, ~5 new .baml files"
+        - "Token usage tracking via Collector API needs investigation"
+      recommended_approach: "Minimal replacement — only reasoning model output handling. Keep vision step unchanged."
+      decisions_made: []
+    codebase_analysis:
+      key_files: [backend/src/workflow.ts, fixtures/types.ts, backend/package.json, backend/src/index.ts]
+      primary_language: typescript
+      summary: "Two-model pipeline (vision+reasoning). extractJson/isValidWorkflow handle ~35 lines of cleanup. Zero API contract changes needed."
+    clarifications:
+      - "Token usage tracking required — BAML Collector API for reasoning, OpenAI SDK for vision"
+      - "Only reasoning model migrates to BAML, vision stays on OpenAI SDK"
+      - "Keep openai package for vision model"
+    gap_analysis:
+      integration_points: [workflow.ts buildWorkflow, workflow.ts analyzeWorkflow, backend/package.json]
+      summary: "Low risk migration. ~35 lines to remove, ~40 to modify, 4 new .baml files. BAML SAP replaces extractJson. Collector API for token tracking. No API/frontend changes."
+    scope_clarifications:
+      scope_expanded: false
+      summary: "3 decisions resolved: catch BamlValidationError for raw fallback, BAML env syntax for LM Studio URL, keep both type definitions."
+    ui_mockups: {components_designed: [], summary: null}
+    specification: {summary: "10 core requirements, 4 BAML schema files, workflow.ts modifications (~35 lines removed, ~25 modified), Collector API token tracking, BamlValidationError fallback. 9 success criteria."}
+    architecture_decision: {decision: "BAML openai-generic with env.LM_STUDIO_URL, rules as runtime param", summary: "Decisions: BamlValidationError→raw fallback, BAML env syntax, keep both type defs, rules as runtime param"}

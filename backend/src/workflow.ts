@@ -4,10 +4,11 @@ import { resolve, dirname } from 'path'
 import { fileURLToPath } from 'url'
 import { log, clearLog } from './logger.ts'
 import type { Contact } from '../../fixtures/types.ts'
+import { b } from '../baml_client/index.js'
+import { Collector, BamlValidationError } from '@boundaryml/baml'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
 const CONTACTS_PATH = resolve(__dirname, '../../fixtures/contacts.json')
-const TYPES_PATH = resolve(__dirname, '../../fixtures/types.ts')
 
 const LM_STUDIO_BASE_URL = process.env.LM_STUDIO_URL ?? 'http://localhost:1234/v1'
 
@@ -29,10 +30,6 @@ function addUsage(total: TokenUsage, usage?: OpenAI.CompletionUsage | null) {
 async function loadContacts(): Promise<Contact[]> {
   const raw = await readFile(CONTACTS_PATH, 'utf-8')
   return JSON.parse(raw) as Contact[]
-}
-
-async function loadWorkflowTypes(): Promise<string> {
-  return await readFile(TYPES_PATH, 'utf-8')
 }
 
 async function interpretImage(imageBase64: string, mimeType: string, usage: TokenUsage): Promise<string> {
@@ -87,58 +84,21 @@ Output a structured text description with numbered stages.`
   return result
 }
 
-async function buildWorkflow(imageDescription: string, contacts: Contact[], workflowTypes: string, usage: TokenUsage): Promise<string> {
-  const contactsJson = JSON.stringify(contacts, null, 2)
-
-  const systemPrompt = `You are an expert workflow architect. Your task is to build a structured Workflow JSON object from a workflow diagram description.
-
-Here is the FULL LIST of contacts in the organization:
-${contactsJson}
+function buildInstructions(): string {
+  return `You are an expert workflow architect. Your task is to build a structured Workflow JSON object from a workflow diagram description.
 
 Your job:
-1. Compare ALL person names from the diagram against the contacts list above. Account for OCR errors — names may be misspelled, truncated, or slightly wrong (e.g. "Ping" instead of "Pino", "Cutlor" instead of "Cutler", "Karthi" instead of "Karthikeyan"). Use fuzzy/partial matching on first name or last name.
-2. For each matched person, populate "name" (use the contact's name, NOT the OCR'd name from the diagram), "id", and "role" from the contacts list.
+1. Compare ALL person names from the diagram against the contacts list provided. Account for OCR errors — names may be misspelled, truncated, or slightly wrong (e.g. "Ping" instead of "Pino", "Cutlor" instead of "Cutler", "Karthi" instead of "Karthikeyan"). Use fuzzy/partial matching on first name or last name.
+2. For each matched person, populate "name" (use the contact's name, NOT the OCR'd name from the diagram), "id", and "role" from the contacts list provided.
 3. If a person from the diagram does NOT match any contact even with fuzzy matching, set ONLY "name" (as written in diagram) and "role". Do NOT populate "id" or invent data.
 4. For stages WITHOUT specific people assigned, suggest 1-2 contacts based on position relevance. For sign-off/final approval stages, pick the HIGHEST-ranking contacts (CTO, VP, Director).
-5. Output a valid JSON object matching the Workflow type.
-
-Use the following TypeScript types to structure your output:
-${workflowTypes}
 
 IMPORTANT RULES:
-- Do NOT make up data. Only use contacts from the list above.
+- Do NOT make up data. Only use contacts from the contacts list provided.
 - The "role" should default to "approver" unless the diagram indicates otherwise (e.g. "reviewer", "readonly").
 - All decisions should default to "pending".
 - The workflow decision should be "pending".
-- Parallel stages (no dependency between them) should NOT have dependsOn referencing each other.
-- Output ONLY a valid JSON object matching the Workflow type. No extra text, no markdown fences, no explanations.`
-
-  const userMessage = `Here is the description of the approval workflow diagram:\n\n${imageDescription}\n\nBuild the complete Workflow JSON object. Match all people from the diagram to contacts using fuzzy matching. Stages without assigned people need a suggested contact based on position relevance.`
-
-  log('\n[BUILD] Sending prompt to openai/gpt-oss-20b')
-  log('[BUILD] System prompt:', systemPrompt)
-  log('[BUILD] User message:', userMessage)
-
-  let response
-  try {
-    response = await client.chat.completions.create({
-      model: 'openai/gpt-oss-20b',
-      temperature: 0.5,
-      messages: [
-        { role: 'system', content: systemPrompt },
-        { role: 'user', content: userMessage },
-      ],
-    })
-  } catch (err) {
-    log('[BUILD] ERROR calling reasoning model:', (err as Error).message)
-    log('[BUILD] Stack:', (err as Error).stack)
-    throw err
-  }
-
-  addUsage(usage, response.usage)
-  const result = response.choices[0]?.message?.content ?? ''
-  log('[BUILD] Response:', result)
-  return result
+- Parallel stages (no dependency between them) should NOT have dependsOn referencing each other.`
 }
 
 export async function analyzeWorkflow(imageBase64: string, mimeType: string) {
@@ -149,51 +109,33 @@ export async function analyzeWorkflow(imageBase64: string, mimeType: string) {
   const imageDescription = await interpretImage(imageBase64, mimeType, usage)
   log('Image interpretation complete.')
 
-  log('\nStep 2: Loading contacts and types...')
-  const [contacts, workflowTypes] = await Promise.all([loadContacts(), loadWorkflowTypes()])
+  log('\nStep 2: Loading contacts...')
+  const contacts = await loadContacts()
   log(`Loaded ${contacts.length} contacts.`)
 
-  log('\nStep 3: Building workflow structure with reasoning model...')
-  const result = await buildWorkflow(imageDescription, contacts, workflowTypes, usage)
-
-  log('\nWorkflow analysis complete.')
-  log('[RESULT]', result)
-
-  const cleaned = extractJson(result)
-  log('[CLEANED]', cleaned)
-  log('[USAGE]', JSON.stringify(usage))
+  log('\nStep 3: Building workflow structure with BAML...')
+  const collector = new Collector("reasoning-model")
+  const instructions = buildInstructions()
+  const contactsJson = JSON.stringify(contacts, null, 2)
 
   try {
-    const parsed = JSON.parse(cleaned)
-    if (isValidWorkflow(parsed)) {
-      return { workflow: parsed, usage }
+    const workflow = await b.ExtractWorkflow(imageDescription, contactsJson, instructions, { collector })
+
+    const bamlUsage = collector.last
+    usage.promptTokens += bamlUsage?.usage?.inputTokens ?? 0
+    usage.completionTokens += bamlUsage?.usage?.outputTokens ?? 0
+    usage.totalTokens += (bamlUsage?.usage?.inputTokens ?? 0) + (bamlUsage?.usage?.outputTokens ?? 0)
+
+    log('\nWorkflow analysis complete.')
+    log('[RESULT]', JSON.stringify(workflow))
+    log('[USAGE]', JSON.stringify(usage))
+
+    return { workflow, usage }
+  } catch (e) {
+    if (e instanceof BamlValidationError) {
+      log('[BAML_ERROR] Validation failed, raw output:', e.raw_output)
+      return { raw: e.raw_output, usage }
     }
-    log('[WARN] Parsed JSON is not a valid Workflow (missing stages). Raw:', cleaned)
-    return { raw: result, usage }
-  } catch {
-    return { raw: result, usage }
+    throw e
   }
-}
-
-function isValidWorkflow(obj: unknown): boolean {
-  return (
-    typeof obj === 'object' &&
-    obj !== null &&
-    'stages' in obj &&
-    Array.isArray((obj as Record<string, unknown>).stages)
-  )
-}
-
-function extractJson(text: string): string {
-  let cleaned = text.replace(/<\|[^>]*\|>/g, '')
-  cleaned = cleaned.replace(/```json\s*/g, '').replace(/```\s*/g, '')
-  cleaned = cleaned.trim()
-
-  const start = cleaned.indexOf('{')
-  const end = cleaned.lastIndexOf('}')
-  if (start !== -1 && end !== -1 && end > start) {
-    return cleaned.slice(start, end + 1)
-  }
-
-  return cleaned
 }
