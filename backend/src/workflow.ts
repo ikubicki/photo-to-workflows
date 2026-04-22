@@ -87,13 +87,17 @@ Output a structured text description with numbered stages.`
 function buildInstructions(): string {
   return `You are an expert workflow architect. Your task is to build a structured Workflow JSON object from a workflow diagram description.
 
+CRITICAL: Every rectangle/box in the diagram description MUST become a separate Stage in the output. Do NOT skip or merge any stages. If a box has no people/names listed inside, create the stage with an EMPTY participants array.
+
 Your job:
-1. Compare ALL person names from the diagram against the contacts list provided. Account for OCR errors — names may be misspelled, truncated, or slightly wrong (e.g. "Ping" instead of "Pino", "Cutlor" instead of "Cutler", "Karthi" instead of "Karthikeyan"). Use fuzzy/partial matching on first name or last name.
-2. For each matched person, populate "name" (use the contact's name, NOT the OCR'd name from the diagram), "id", and "role" from the contacts list provided.
-3. If a person from the diagram does NOT match any contact even with fuzzy matching, set ONLY "name" (as written in diagram) and "role". Do NOT populate "id" or invent data.
-4. For stages WITHOUT specific people assigned, suggest 1-2 contacts based on position relevance. For sign-off/final approval stages, pick the HIGHEST-ranking contacts (CTO, VP, Director).
+1. First, create ALL stages from the diagram — one Stage per box/rectangle described. Preserve the exact stage names and dependency structure.
+2. Compare ALL person names from the diagram against the contacts list provided. Account for OCR errors — names may be misspelled, truncated, or slightly wrong (e.g. "Ping" instead of "Pino", "Cutlor" instead of "Cutler", "Karthi" instead of "Karthikeyan"). Use fuzzy/partial matching on first name or last name.
+3. For each matched person, populate "name" (use the contact's name, NOT the OCR'd name from the diagram), "id", and "role" from the contacts list provided.
+4. If a person from the diagram does NOT match any contact even with fuzzy matching, set ONLY "name" (as written in diagram) and "role". Do NOT populate "id" or invent data.
+5. For stages WITHOUT specific people assigned, suggest 1-2 contacts based on position relevance. For sign-off/final approval stages, pick the HIGHEST-ranking contacts (CTO, VP, Director).
 
 IMPORTANT RULES:
+- Every box/rectangle in the diagram = one Stage. No exceptions. No merging. No duplicating — each box appears EXACTLY once.
 - Do NOT make up data. Only use contacts from the contacts list provided.
 - The "role" should default to "approver" unless the diagram indicates otherwise (e.g. "reviewer", "readonly").
 - All decisions should default to "pending".

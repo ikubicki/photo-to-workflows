@@ -1,6 +1,6 @@
 orchestrator:
   started_phase: phase-14
-  completed_phases: [phase-1, phase-2, phase-5, phase-6, phase-7, phase-8, phase-10, phase-11]
+  completed_phases: [phase-1, phase-2, phase-5, phase-6, phase-7, phase-8, phase-10, phase-11, phase-14]
   failed_phases: []
   auto_fix_attempts: {}
   options:
@@ -20,7 +20,7 @@ orchestrator:
 task:
   title: "Replace extractJson with BAML"
   description: "Replace extractJson() and isValidWorkflow() in backend/src/workflow.ts with BAML structured output parsing. Install BAML, create .baml schema files mapping current Workflow types, configure LM Studio via openai-generic provider, and replace buildWorkflow() output handling with typed BAML function call."
-  status: in_progress
+  status: completed
   tags: [baml, llm-output, structured-data, backend]
   priority: medium
 
