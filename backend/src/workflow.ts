@@ -10,6 +10,8 @@ const CONTACTS_PATH = resolve(__dirname, '../../fixtures/contacts.json')
 const TYPES_PATH = resolve(__dirname, '../../fixtures/types.ts')
 
 const LM_STUDIO_BASE_URL = process.env.LM_STUDIO_URL ?? 'http://localhost:1234/v1'
+const VISION_MODEL = process.env.VISION_MODEL ?? 'qwen/qwen3-vl-8b'
+const WORKFLOW_MODEL = process.env.WORKFLOW_MODEL ?? VISION_MODEL
 
 const client = new OpenAI({
   baseURL: LM_STUDIO_BASE_URL,
@@ -18,6 +20,8 @@ const client = new OpenAI({
 })
 
 type TokenUsage = { promptTokens: number; completionTokens: number; totalTokens: number }
+
+type JsonSchema = Record<string, unknown>
 
 function addUsage(total: TokenUsage, usage?: OpenAI.CompletionUsage | null) {
   if (!usage) return
@@ -35,6 +39,84 @@ async function loadWorkflowTypes(): Promise<string> {
   return await readFile(TYPES_PATH, 'utf-8')
 }
 
+function extractLiteralUnion(source: string): string[] {
+  const values = source.match(/'([^']+)'/g) ?? []
+  return values.map((value) => value.slice(1, -1))
+}
+
+function buildWorkflowJsonSchema(workflowTypes: string): JsonSchema {
+  const decisionEnumBlock = workflowTypes.match(/export enum Decision\s*\{([\s\S]*?)\}/)?.[1] ?? ''
+  const decisions = (decisionEnumBlock.match(/=\s*'([^']+)'/g) ?? []).map((item) => item.split("'")[1])
+
+  const roleUnionBlock = workflowTypes.match(/role:\s*([^\n,]+)/)?.[1] ?? ''
+  const roles = extractLiteralUnion(roleUnionBlock)
+
+  const conditionUnionBlock = workflowTypes.match(/condition:\s*([\s\S]*?)\n\s*decision\?:/)?.[1] ?? ''
+  const dependencyConditions = extractLiteralUnion(conditionUnionBlock)
+
+  const decisionValues = decisions.length > 0 ? decisions : ['approved', 'rejected', 'change_requested', 'pending', 'completed']
+  const roleValues = roles.length > 0 ? roles : ['approver', 'reviewer', 'readonly']
+  const conditionValues = dependencyConditions.length > 0 ? dependencyConditions : ['decision', 'deadline', 'completion']
+
+  return {
+    type: 'object',
+    additionalProperties: false,
+    required: ['name', 'stages'],
+    properties: {
+      name: { type: 'string' },
+      stages: {
+        type: 'array',
+        items: {
+          type: 'object',
+          additionalProperties: false,
+          required: ['name', 'participants'],
+          properties: {
+            name: { type: 'string' },
+            participants: {
+              type: 'array',
+              items: {
+                type: 'object',
+                additionalProperties: false,
+                required: ['name', 'role'],
+                properties: {
+                  name: { type: 'string' },
+                  id: { type: 'string', nullable: true },
+                  role: { type: 'string', enum: roleValues },
+                  decision: { type: 'string', enum: decisionValues },
+                },
+              },
+            },
+            dependsOn: {
+              type: 'array',
+              items: {
+                type: 'object',
+                additionalProperties: false,
+                required: ['parentStageId', 'condition'],
+                properties: {
+                  parentStageId: { type: 'string' },
+                  condition: { type: 'string', enum: conditionValues },
+                  decision: { type: 'string', enum: decisionValues },
+                  deadline: { type: 'string' },
+                },
+              },
+            },
+            deadline: { type: 'string' },
+            decision: { type: 'string', enum: decisionValues },
+            metadata: { type: 'object' },
+          },
+        },
+      },
+      metadata: { type: 'object' },
+      decision: {
+        oneOf: [
+          { type: 'string', enum: decisionValues },
+          { type: 'array', items: { type: 'string', enum: decisionValues } },
+        ],
+      },
+    },
+  }
+}
+
 async function interpretImage(imageBase64: string, mimeType: string, usage: TokenUsage): Promise<string> {
   const systemText = `You are an expert at reading approval workflow diagrams. Your job is to extract ALL information accurately.
 
@@ -50,11 +132,12 @@ RULES:
 - Describe the FULL dependency graph: which stages depend on which, and what condition triggers the next stage (e.g. "approved", "approved or approved with changes", "completed").
 - If an arrow/condition says "approved/with changes", interpret it as TWO conditions: "approved" AND "approved with changes". Both outcomes lead to the next stage.
 - If a stage has no participants listed, explicitly note that.
+- If you see a duplicated box (same stage repeated due to scan/diagram artifact), keep only one instance and ignore the duplicate.
 
 Output a structured text description with numbered stages.`
   const userText = 'Analyze this approval workflow diagram. Count ALL rectangles/boxes — each one is a stage. List every stage with its participants, roles, and the dependency/condition arrows between stages. Pay special attention to parallel vs sequential stages and read all names very carefully character by character.'
 
-  log('\n[VISION] Sending prompt to qwen/qwen3-vl-8b')
+  log(`\n[VISION] Sending prompt to ${VISION_MODEL}`)
   log('[VISION] System:', systemText)
   log('[VISION] User:', userText)
   log(`[VISION] Image: ${mimeType}, ${Math.round(imageBase64.length * 0.75 / 1024)}KB`)
@@ -62,7 +145,7 @@ Output a structured text description with numbered stages.`
   let response
   try {
     response = await client.chat.completions.create({
-      model: 'qwen/qwen3-vl-8b',
+      model: VISION_MODEL,
       temperature: 0.1,
       messages: [
         { role: 'system', content: systemText },
@@ -89,6 +172,7 @@ Output a structured text description with numbered stages.`
 
 async function buildWorkflow(imageDescription: string, contacts: Contact[], workflowTypes: string, usage: TokenUsage): Promise<string> {
   const contactsJson = JSON.stringify(contacts, null, 2)
+  const workflowJsonSchema = buildWorkflowJsonSchema(workflowTypes)
 
   const systemPrompt = `You are an expert workflow architect. Your task is to build a structured Workflow JSON object from a workflow diagram description.
 
@@ -115,24 +199,77 @@ IMPORTANT RULES:
 
   const userMessage = `Here is the description of the approval workflow diagram:\n\n${imageDescription}\n\nBuild the complete Workflow JSON object. Match all people from the diagram to contacts using fuzzy matching. Stages without assigned people need a suggested contact based on position relevance.`
 
-  log('\n[BUILD] Sending prompt to openai/gpt-oss-20b')
+  log(`\n[BUILD] Sending prompt to ${WORKFLOW_MODEL}`)
   log('[BUILD] System prompt:', systemPrompt)
   log('[BUILD] User message:', userMessage)
 
   let response
   try {
     response = await client.chat.completions.create({
-      model: 'openai/gpt-oss-20b',
+      model: WORKFLOW_MODEL,
       temperature: 0.5,
+      response_format: {
+        type: 'json_schema',
+        json_schema: {
+          name: 'workflow',
+          strict: true,
+          schema: workflowJsonSchema,
+        },
+      },
       messages: [
         { role: 'system', content: systemPrompt },
         { role: 'user', content: userMessage },
       ],
     })
   } catch (err) {
-    log('[BUILD] ERROR calling reasoning model:', (err as Error).message)
-    log('[BUILD] Stack:', (err as Error).stack)
-    throw err
+    const message = (err as Error).message
+    const isResponseFormatUnsupported = /response_format|json_schema|json_object|unsupported|not support|invalid/i.test(message)
+
+    if (!isResponseFormatUnsupported) {
+      log('[BUILD] ERROR calling reasoning model:', message)
+      log('[BUILD] Stack:', (err as Error).stack)
+      throw err
+    }
+
+    log('[BUILD] response_format=json_schema unsupported, retrying with json_object')
+
+    try {
+      response = await client.chat.completions.create({
+        model: WORKFLOW_MODEL,
+        temperature: 0.5,
+        response_format: { type: 'json_object' },
+        messages: [
+          { role: 'system', content: systemPrompt },
+          { role: 'user', content: userMessage },
+        ],
+      })
+    } catch (retryErr) {
+      const retryMessage = (retryErr as Error).message
+      const isJsonObjectUnsupported = /response_format|json_object|unsupported|not support|invalid/i.test(retryMessage)
+
+      if (!isJsonObjectUnsupported) {
+        log('[BUILD] ERROR calling reasoning model on retry:', retryMessage)
+        log('[BUILD] Stack:', (retryErr as Error).stack)
+        throw retryErr
+      }
+
+      log('[BUILD] response_format=json_object unsupported, retrying without response_format')
+
+      try {
+        response = await client.chat.completions.create({
+          model: WORKFLOW_MODEL,
+          temperature: 0.5,
+          messages: [
+            { role: 'system', content: systemPrompt },
+            { role: 'user', content: userMessage },
+          ],
+        })
+      } catch (lastErr) {
+        log('[BUILD] ERROR calling reasoning model on final retry:', (lastErr as Error).message)
+        log('[BUILD] Stack:', (lastErr as Error).stack)
+        throw lastErr
+      }
+    }
   }
 
   addUsage(usage, response.usage)
