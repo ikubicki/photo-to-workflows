@@ -117,64 +117,28 @@ function buildWorkflowJsonSchema(workflowTypes: string): JsonSchema {
   }
 }
 
-async function interpretImage(imageBase64: string, mimeType: string, usage: TokenUsage): Promise<string> {
-  const systemText = `You are an expert at reading approval workflow diagrams. Your job is to extract ALL information accurately.
-
-RULES:
-- Each rectangle/box in the diagram is a SEPARATE stage. Count every single one — do NOT merge or skip any.
-- Stages positioned side-by-side (horizontally aligned) are PARALLEL — they start at the same time and have NO dependency on each other.
-- Stages positioned one below/after another (vertically or sequentially connected) are SEQUENTIAL.
-- Pay very close attention to arrows and connectors: they show dependencies and conditions between stages.
-- Read ALL text inside and near each box carefully: stage names, people names, roles, conditions.
-- OCR can be tricky — read names character by character. Common OCR errors: 'ng' misread as 'no', 'rn' misread as 'm', letters confused. Double-check every person's name.
-- A participant name might be very short — even a single character (e.g. "H"). If two names appear on separate lines inside a box, they are SEPARATE participants. Do NOT merge them into one name.
-- For each stage, list: stage name, all participants (names exactly as written), their roles, and any conditions/decisions on connecting arrows.
-- Describe the FULL dependency graph: which stages depend on which, and what condition triggers the next stage (e.g. "approved", "approved or approved with changes", "completed").
-- If an arrow/condition says "approved/with changes", interpret it as TWO conditions: "approved" AND "approved with changes". Both outcomes lead to the next stage.
-- If a stage has no participants listed, explicitly note that.
-- If you see a duplicated box (same stage repeated due to scan/diagram artifact), keep only one instance and ignore the duplicate.
-
-Output a structured text description with numbered stages.`
-  const userText = 'Analyze this approval workflow diagram. Count ALL rectangles/boxes — each one is a stage. List every stage with its participants, roles, and the dependency/condition arrows between stages. Pay special attention to parallel vs sequential stages and read all names very carefully character by character.'
-
-  log(`\n[VISION] Sending prompt to ${VISION_MODEL}`)
-  log('[VISION] System:', systemText)
-  log('[VISION] User:', userText)
-  log(`[VISION] Image: ${mimeType}, ${Math.round(imageBase64.length * 0.75 / 1024)}KB`)
-
-  let response
-  try {
-    response = await client.chat.completions.create({
-      model: VISION_MODEL,
-      temperature: 0.1,
-      messages: [
-        { role: 'system', content: systemText },
-        {
-          role: 'user',
-          content: [
-            { type: 'image_url', image_url: { url: `data:${mimeType};base64,${imageBase64}` } },
-            { type: 'text', text: userText },
-          ],
-        },
-      ],
-    })
-  } catch (err) {
-    log('[VISION] ERROR calling vision model:', (err as Error).message)
-    log('[VISION] Stack:', (err as Error).stack)
-    throw err
-  }
-
-  addUsage(usage, response.usage)
-  const result = response.choices[0]?.message?.content ?? ''
-  log('[VISION] Response:', result)
-  return result
-}
-
-async function buildWorkflow(imageDescription: string, contacts: Contact[], workflowTypes: string, usage: TokenUsage): Promise<string> {
+async function buildWorkflowFromImage(
+  imageBase64: string,
+  mimeType: string,
+  contacts: Contact[],
+  workflowTypes: string,
+  usage: TokenUsage
+): Promise<string> {
   const contactsJson = JSON.stringify(contacts, null, 2)
   const workflowJsonSchema = buildWorkflowJsonSchema(workflowTypes)
 
-  const systemPrompt = `You are an expert workflow architect. Your task is to build a structured Workflow JSON object from a workflow diagram description.
+  const systemPrompt = `You are an expert workflow architect. Your task is to read an approval workflow diagram image and output a structured Workflow JSON object.
+
+OCR + DIAGRAM RULES:
+- Each rectangle/box in the diagram is a SEPARATE stage. Count every single one - do NOT merge or skip any.
+- If you see a duplicated box (same stage repeated due to scan/diagram artifact), keep only one instance and ignore the duplicate.
+- Stages positioned side-by-side (horizontally aligned) are PARALLEL - they start at the same time and have NO dependency on each other.
+- Stages positioned one below/after another (vertically or sequentially connected) are SEQUENTIAL.
+- Pay very close attention to arrows and connectors: they show dependencies and conditions between stages.
+- Read ALL text inside and near each box carefully: stage names, people names, roles, conditions.
+- OCR can be tricky - read names character by character. Common OCR errors: 'ng' misread as 'no', 'rn' misread as 'm', letters confused. Double-check every person's name.
+- A participant name might be very short - even a single character (e.g. "H"). If two names appear on separate lines inside a box, they are SEPARATE participants. Do NOT merge them into one name.
+- If an arrow/condition says "approved/with changes", interpret it as TWO outcomes: "approved" AND "approved with changes".
 
 Here is the FULL LIST of contacts in the organization:
 ${contactsJson}
@@ -197,11 +161,12 @@ IMPORTANT RULES:
 - Parallel stages (no dependency between them) should NOT have dependsOn referencing each other.
 - Output ONLY a valid JSON object matching the Workflow type. No extra text, no markdown fences, no explanations.`
 
-  const userMessage = `Here is the description of the approval workflow diagram:\n\n${imageDescription}\n\nBuild the complete Workflow JSON object. Match all people from the diagram to contacts using fuzzy matching. Stages without assigned people need a suggested contact based on position relevance.`
+  const userText = 'Analyze this approval workflow diagram image and return the complete Workflow JSON object. Match all people from the diagram to contacts using fuzzy matching. Stages without assigned people need a suggested contact based on position relevance.'
 
-  log(`\n[BUILD] Sending prompt to ${WORKFLOW_MODEL}`)
+  log(`\n[BUILD] Sending multimodal prompt to ${WORKFLOW_MODEL}`)
   log('[BUILD] System prompt:', systemPrompt)
-  log('[BUILD] User message:', userMessage)
+  log('[BUILD] User message:', userText)
+  log(`[BUILD] Image: ${mimeType}, ${Math.round(imageBase64.length * 0.75 / 1024)}KB`)
 
   let response
   try {
@@ -218,7 +183,13 @@ IMPORTANT RULES:
       },
       messages: [
         { role: 'system', content: systemPrompt },
-        { role: 'user', content: userMessage },
+        {
+          role: 'user',
+          content: [
+            { type: 'image_url', image_url: { url: `data:${mimeType};base64,${imageBase64}` } },
+            { type: 'text', text: userText },
+          ],
+        },
       ],
     })
   } catch (err) {
@@ -240,7 +211,13 @@ IMPORTANT RULES:
         response_format: { type: 'json_object' },
         messages: [
           { role: 'system', content: systemPrompt },
-          { role: 'user', content: userMessage },
+            {
+              role: 'user',
+              content: [
+                { type: 'image_url', image_url: { url: `data:${mimeType};base64,${imageBase64}` } },
+                { type: 'text', text: userText },
+              ],
+            },
         ],
       })
     } catch (retryErr) {
@@ -261,7 +238,13 @@ IMPORTANT RULES:
           temperature: 0.5,
           messages: [
             { role: 'system', content: systemPrompt },
-            { role: 'user', content: userMessage },
+            {
+              role: 'user',
+              content: [
+                { type: 'image_url', image_url: { url: `data:${mimeType};base64,${imageBase64}` } },
+                { type: 'text', text: userText },
+              ],
+            },
           ],
         })
       } catch (lastErr) {
@@ -282,16 +265,12 @@ export async function analyzeWorkflow(imageBase64: string, mimeType: string) {
   clearLog()
   const usage: TokenUsage = { promptTokens: 0, completionTokens: 0, totalTokens: 0 }
 
-  log('Step 1: Interpreting workflow diagram image with vision model...')
-  const imageDescription = await interpretImage(imageBase64, mimeType, usage)
-  log('Image interpretation complete.')
-
-  log('\nStep 2: Loading contacts and types...')
+  log('Step 1: Loading contacts and types...')
   const [contacts, workflowTypes] = await Promise.all([loadContacts(), loadWorkflowTypes()])
   log(`Loaded ${contacts.length} contacts.`)
 
-  log('\nStep 3: Building workflow structure with reasoning model...')
-  const result = await buildWorkflow(imageDescription, contacts, workflowTypes, usage)
+  log('\nStep 2: Building workflow structure directly from image...')
+  const result = await buildWorkflowFromImage(imageBase64, mimeType, contacts, workflowTypes, usage)
 
   log('\nWorkflow analysis complete.')
   log('[RESULT]', result)
