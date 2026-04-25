@@ -23,7 +23,7 @@ Both models are served locally via **LM Studio** (OpenAI-compatible API at `http
 
 | Branch | Description |
 |--------|-------------|
-| `no-langchain` ⭐ | **Primary branch.** Removes the LangChain dependency and calls the OpenAI SDK directly. Merges the OCR and workflow interpretation into a single model call, reducing latency. |
+| `no-langchain` ⭐ | **Primary branch.** Removes the LangChain dependency and calls the OpenAI SDK directly. Merges the OCR and workflow interpretation into a single model call using only `qwen/qwen3-vl-8b`, reducing latency. |
 | `main` | Original implementation using **LangChain** with OpenAI-compatible SDK. Includes a multi-step agent loop with tools (`get_contacts`, `find_contact_by_name`, `find_contact_by_position`), token usage tracking, and structured error logging. |
 | `baml` | Experimental branch replacing manual JSON extraction (`extractJson` / `isValidWorkflow`) with **BAML** (Boundary AI Markup Language) for structured, type-safe model output. |
 
